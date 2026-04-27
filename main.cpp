@@ -1,13 +1,11 @@
 // Ford Focus MK3 (BM5T) / bench cluster emulator
-// v6.8 — база v6.3 + два фикса
+// v7.6
 //
-// РУЧНИК — найдена причина: переменная handbrake не использовалась в 0x240!
-//   В sendHandbrake() было статичное byte3 = 0x40, теперь с битом из переменной
-//   В sendIndicators() убираем |=0x40 из 0x03A — это был ложный бит ручника
-//
-// ПЕРЕГРЕВ → ручник: зажимаем температуру в 0x320 на 105С
-//   (как уже делали в v5.9)
-//   Стрелка термометра по 0x360 пойдёт в красную зону без ограничений
+// ИЗМЕНЕНИЯ:
+//   1) ОТКАТ умной отправки → возврат к t10 (100 пакетов/сек как в v7.0)
+//   2) 0x290 ВКЛЮЧЁН обратно (он гасит ручник и тормозную жидкость)
+//   3) При перегреве: масленка + CHECK ENGINE одновременно (в одном фрейме 0x250)
+//   4) BRAKE при перегреве оставлен (штатное поведение приборки)
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -17,10 +15,13 @@
 MCP_CAN CAN(CAN_CS);
 
 #define ABS_FORCE_ON false
+#define OIL_WARN_TEMP 110
+#define FUEL_RESET_THRESHOLD 30
+#define RESET_DASH_ENABLED true
 
 int  speed_kmh      = 0;
 int  rpm            = 0;
-int  fuel_percent   = 50;
+int  fuel_percent   = 100;
 int  coolant_temp   = 85;
 int  outside_temp_c = 20;
 
@@ -50,7 +51,7 @@ float deceleration = 0.0f;
 String serialBuffer;
 uint32_t fuel_update_count = 0;
 
-unsigned long t10    = 0;
+unsigned long t10    = 0;   // вернули таймер 10мс для топлива
 unsigned long t50    = 0;
 unsigned long t100   = 0;
 unsigned long t120   = 0;
@@ -62,15 +63,11 @@ bool sendCAN(uint32_t id, const uint8_t *data, uint8_t len = 8) {
   return CAN.sendMsgBuf(id, 0, len, (uint8_t*)data) == CAN_OK;
 }
 
-// 0x03A — поворотники + ESP (БЕЗ ручника!)
-// Раньше был ложный бит handbrake — убрал, ручник теперь только в 0x240
 void sendIndicators() {
   uint8_t byte1 = 0x83;
   if (left_turn)    byte1 |= 0x04;
   if (right_turn)   byte1 |= 0x08;
   if (esp_active)   byte1 |= 0x20;
-  // УБРАНО: if (handbrake) byte1 |= 0x40;  ← это был не тот бит
-
   uint8_t d[8] = {0x82, byte1, 0x00, 0x02, 0x80, 0x00, 0x00, 0x00};
   sendCAN(0x03A, d);
 }
@@ -153,22 +150,31 @@ void sendImmobiliser() {
   sendCAN(0x1E0, d);
 }
 
-// 0x240 — ручник (ИСПРАВЛЕНО!)
-// Формула из bigunclemax: byte3 = 0x40 | (brakeApplied << 7)
-//   ВЫКЛ: byte3 = 0x40
-//   ВКЛ:  byte3 = 0xC0 (бит 7 = 0x80 + базовый 0x40)
-// Раньше я не использовал переменную handbrake вообще — баг
 void sendHandbrake() {
   uint8_t b3 = handbrake ? 0xC0 : 0x40;
   uint8_t d[8] = {0x00, 0x02, 0x00, b3, 0x00, 0x00, 0x00, 0x00};
   sendCAN(0x240, d);
 }
 
+// 0x250 — engine + oil
+// При перегреве: ОБА индикатора одновременно
+//   - масленка через byte1 0xD5 → 0x0D (как в v6.9)
+//   - check engine через byte0 0x20 → 0x40 (как в v7.4)
+// Из FocusIPCCtrl таблицы: oil+eng = {0x40, 0x0D, ...}
 void sendEngineOil() {
-  uint8_t d[8] = {0x20, 0xD5, 0x18, 0x04, 0x1C, 0x11, 0x00, 0x00};
-  sendCAN(0x250, d);
+  bool oil_light = (coolant_temp > OIL_WARN_TEMP);
+  if (oil_light) {
+    // масленка + check engine при перегреве
+    uint8_t d[8] = {0x40, 0x0D, 0x18, 0x04, 0x1C, 0x11, 0x00, 0x00};
+    sendCAN(0x250, d);
+  } else {
+    uint8_t d[8] = {0x20, 0xD5, 0x18, 0x04, 0x1C, 0x11, 0x00, 0x00};
+    sendCAN(0x250, d);
+  }
 }
 
+// 0x290 — brake fluid / washer
+// ВКЛЮЧЁН обратно (он гасит ручник и низкий уровень жидкости)
 void sendBrakeFluidWasher() {
   uint8_t d[8] = {0x98, 0x00, 0x01, 0x00, 0x04, 0x03, 0x92, 0x37};
   sendCAN(0x290, d);
@@ -197,51 +203,46 @@ void sendABS_213() {
   sendCAN(0x213, d);
 }
 
-// 0x320 — топливо + температура
-// ИЗМЕНЕНИЕ: температура для 0x320 ограничена 105С
-// Стрелка термометра идёт по 0x360 без ограничений
-// Это должно убрать ложное зажигание ручника при перегреве
+// 0x320 — топливо (как в v7.0)
+// Простая отправка каждые 10мс — приборка получает 100 пакетов/сек
+// Это и обеспечивает быструю стрелку (БЕЗ умной отправки)
 void sendFuel() {
   int safe_fuel = constrain(fuel_percent, 0, 100);
-
-  // Температура для 0x320 ОГРАНИЧЕНА 105С
-  int safe_temp_for_320 = constrain(coolant_temp, -40, 105);
 
   uint16_t fuel_val = 7936 - (safe_fuel * 53 / 10);
   uint8_t fuel_h = ((fuel_val >> 8) & 0xFF) | 0x10;
   uint8_t fuel_l = fuel_val & 0xFF;
 
-  uint16_t temp_val = (safe_temp_for_320 + 40) * 10;
-  uint8_t temp_h = (temp_val >> 8) & 0xFF;
-  uint8_t temp_l = temp_val & 0xFF;
-
-  uint8_t b4 = 0x10;
-  uint8_t b5 = 0x01;
+  uint8_t b4 = 0x00;
+  uint8_t b5 = 0x00;
   if (fuel_percent <= 10) {
-    b4 = 0x01;
-    b5 = 0x00;
+    b4 = 0x10;
+    b5 = 0x01;
   } else if (fuel_percent <= 12) {
-    b4 = 0x00;
-    b5 = 0x00;
+    // зона гистерезиса
   } else if (low_fuel_sh && fuel_percent <= 15) {
-    b4 = 0x01;
-    b5 = 0x00;
+    b4 = 0x10;
+    b5 = 0x01;
   }
 
   uint8_t d[8] = {
-    temp_h, temp_l,
+    0x00, 0x00,
     fuel_h, fuel_l,
     b4, b5, 0x00, 0x00
   };
   sendCAN(0x320, d);
 }
 
-// 0x360 — стрелка термометра, БЕЗ ограничений (полная температура)
 void sendEngineTemp() {
   int safe_temp = constrain(coolant_temp, -60, 195);
   uint8_t temp  = (uint8_t)(safe_temp + 60);
   uint8_t d[8]  = {0xE0, 0x00, 0x38, 0x40, 0x00, 0xE0, 0x69, temp};
   sendCAN(0x360, d);
+}
+
+void sendResetDash() {
+  uint8_t d[8] = {0x02, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
+  sendCAN(0x720, d);
 }
 
 void sendWheel_4B0() {
@@ -341,6 +342,12 @@ void parseSimHub() {
     if      (key == "FUEL") {
       int new_fuel = (val_f <= 1.5f) ? constrain((int)(val_f*100+0.5f),0,100) : constrain(val,0,100);
       if (new_fuel != fuel_percent) {
+        int diff = new_fuel - fuel_percent;
+        if (RESET_DASH_ENABLED && abs(diff) > FUEL_RESET_THRESHOLD) {
+          sendResetDash();
+          delay(30);
+          sendResetDash();
+        }
         fuel_update_count++;
         fuel_percent = new_fuel;
       }
@@ -370,8 +377,8 @@ void printDiag() {
   Serial.print("[DIAG] FUEL=");        Serial.print(fuel_percent);
   Serial.print(" CLT=");                Serial.print(coolant_temp);
   Serial.print(" HB=");                 Serial.print(handbrake);
+  Serial.print(" oil=");                Serial.print(coolant_temp > OIL_WARN_TEMP ? 1 : 0);
   Serial.print(" | SPD=");              Serial.print(speed_kmh);
-  Serial.print(" decel=");              Serial.print(deceleration, 1);
   Serial.print(" ABS_act=");            Serial.print(abs_active);
   Serial.println();
 }
@@ -387,10 +394,9 @@ void setup() {
   }
   CAN.setMode(MCP_NORMAL);
 
-  Serial.println("=== Focus MK3 bench v6.8 ===");
-  Serial.println("Base: v6.3");
-  Serial.println("FIX 1: handbrake variable now used in 0x240");
-  Serial.println("FIX 2: temp in 0x320 capped at 105C (no false handbrake)");
+  Serial.println("=== Focus MK3 bench v7.6 ===");
+  Serial.println("Fuel: 100 packets/sec (no smart send)");
+  Serial.println("Oil: oil + check engine on overheat");
   Serial.println("CAN OK");
 
   delay(300);
@@ -412,6 +418,7 @@ void loop() {
 
   unsigned long now = millis();
 
+  // Топливо КАЖДЫЕ 10мс — постоянный поток 100/сек (как в v7.0)
   if (now - t10 >= 10) {
     t10 = now;
     sendFuel();
