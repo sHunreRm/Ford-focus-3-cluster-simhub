@@ -113,3 +113,17 @@ README.md
 6. Запустить игру
 
 ---
+
+
+РАСПИНОВКА INSTRUMENT CLUSTER FORD FOCUS 3
+1- MS CAN LOW
+2- MS CAN HIGT
+3- "+"
+4- MM CAN LOW
+5- MM CAN HIGT
+6- Switch signal GND
+7- TOGGLE SIGNAL DIM
+8- TOGGLE SIGNAL MFD
+9- "NOT IN PARK" SIGNAL (Только для АT)
+10 - Power GND
+12- CRANK DETECT 
