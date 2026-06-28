@@ -1,15 +1,16 @@
 
 Проект позволяет использовать реальную приборную панель Ford Focus 3 как игровую через SimHub.
 
-ESP8266 принимает телеметрию (скорость, обороты и т.д.) и отправляет CAN-сообщения в приборку через MCP2515.
+ESP8266 принимает телеметрию (скорость, обороты и т.д.) и отправляет CAN-сообщения в приборку через MCP2515 или Can Bus Shield v1.2. рекомендую использовать Can Bus Shield v1.2, у MCP2515 CAN модуля много брака.
 <img width="1792" height="1440" alt="{218566DB-9904-4B42-BA35-5948A1636AB3}" src="https://github.com/user-attachments/assets/58c763ec-48b1-4b6d-9eae-d93820333ef3" />
+
 
 ---
 
 ## ⚙️ Оборудование
 
 * ESP8266 (NodeMCU V3)
-* MCP2515 CAN модуль
+* Can Bus Shield v1.2 или MCP2515 CAN модуль
 * Приборная панель Ford Focus 3
 * Блок питания 12V
 * Провода
@@ -20,6 +21,7 @@ ESP8266 принимает телеметрию (скорость, оборот�
 
 ### 📡 ESP8266 → MCP2515<img width="684" height="437" alt="{F5D8253B-3BAB-4A44-A59A-2DEAD2E0DB1A}" src="https://github.com/user-attachments/assets/96a44501-4861-4388-907b-f3f0264945b8" />
 <img width="802" height="529" alt="{801ECF83-8A41-4D0B-BD9A-81C1868577B5}" src="https://github.com/user-attachments/assets/c0736670-486a-4476-82ee-b3927b37a071" />
+<img width="975" height="814" alt="{7870441F-9059-4612-91C2-6710436E2A09}" src="https://github.com/user-attachments/assets/14db5fc3-481f-4403-8e9c-1bd80d8bd145" />
 
 
 | MCP2515 | ESP8266     |
@@ -32,6 +34,17 @@ ESP8266 принимает телеметрию (скорость, оборот�
 | MISO    | D6 (GPIO12) |
 | INT     | D1 (GPIO5)  |
 
+---
+
+| Can Bus Shield v1.2 | ESP8266 |
+| ------------------- | ------- |
+| 5V                  | VIN     |
+| GND                 | GND     |
+| D10                 | D8      |
+| D13                 | D5      |
+| D11                 | D7      |
+| D12                 | D6      |
+| D2                  | D2      |
 ---
 
 ### 🚗 MCP2515 → Приборка (контакты приборки)
@@ -58,6 +71,8 @@ ESP8266 принимает телеметрию (скорость, оборот�
 * ОБЩИЙ GND блока питания, esp8266, MCP2515 обязателен!!!
 * CAN шина чувствительна к помехам
 * при необходимости использовать резистор 120 Ом между CANH и CANL
+* если используете mcp2515 нужно поменять частоту в 385 строке кода
+   if (CAN.begin(MCP_ANY, CAN_125KBPS, MCP_16MHZ) != CAN_OK) {    ------>  if (CAN.begin(MCP_ANY, CAN_125KBPS, MCP_8MHZ) != CAN_OK) {
 
 ---
 
@@ -93,6 +108,7 @@ ESP8266 принимает телеметрию (скорость, оборот�
 Тестировалось на:
 
 * ESP8266
+* Can Bus Shield v1.2
 * MCP2515
 * FF3 Cluster
 
