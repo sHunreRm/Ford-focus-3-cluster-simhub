@@ -1,11 +1,11 @@
 // Ford Focus MK3 (BM5T) / bench cluster emulator
-// v7.6
+// v8.1 fuel formula from can_sym.h
 //
-// ИЗМЕНЕНИЯ:
-//   1) ОТКАТ умной отправки → возврат к t10 (100 пакетов/сек как в v7.0)
-//   2) 0x290 ВКЛЮЧЁН обратно (он гасит ручник и тормозную жидкость)
-//   3) При перегреве: масленка + CHECK ENGINE одновременно (в одном фрейме 0x250)
-//   4) BRAKE при перегреве оставлен (штатное поведение приборки)
+// Что изменено:
+// 1) Топливо теперь считается по оригинальной формуле из твоего can_sym.h
+// 2) Убрано сглаживание и искусственный "буст падения"
+// 3) 0x320 снова шлётся быстро, каждые 10 мс
+// 4) Wake-набор оставлен стабильным, чтобы приборка не засыпала
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -16,14 +16,13 @@ MCP_CAN CAN(CAN_CS);
 
 #define ABS_FORCE_ON false
 #define OIL_WARN_TEMP 110
-#define FUEL_RESET_THRESHOLD 30
-#define RESET_DASH_ENABLED true
 
 int  speed_kmh      = 0;
 int  rpm            = 0;
-int  fuel_percent   = 100;
 int  coolant_temp   = 85;
 int  outside_temp_c = 20;
+
+int  fuel_percent   = 100;
 
 bool left_turn      = false;
 bool right_turn     = false;
@@ -38,8 +37,8 @@ bool high_beam      = false;
 bool fog_light      = false;
 bool low_fuel_sh    = false;
 
-bool abs_active              = false;
-bool abs_blink_state         = false;
+bool abs_active                 = false;
+bool abs_blink_state            = false;
 unsigned long abs_request_since = 0;
 unsigned long abs_active_since  = 0;
 unsigned long abs_blink_timer   = 0;
@@ -49,15 +48,14 @@ unsigned long prev_speed_time = 0;
 float deceleration = 0.0f;
 
 String serialBuffer;
-uint32_t fuel_update_count = 0;
 
-unsigned long t10    = 0;   // вернули таймер 10мс для топлива
-unsigned long t50    = 0;
-unsigned long t100   = 0;
-unsigned long t120   = 0;
-unsigned long t300   = 0;
-unsigned long t1000  = 0;
-unsigned long tDiag  = 0;
+unsigned long t10   = 0;
+unsigned long t50   = 0;
+unsigned long t100  = 0;
+unsigned long t120  = 0;
+unsigned long t300  = 0;
+unsigned long t400  = 0;
+unsigned long tDiag = 0;
 
 bool sendCAN(uint32_t id, const uint8_t *data, uint8_t len = 8) {
   return CAN.sendMsgBuf(id, 0, len, (uint8_t*)data) == CAN_OK;
@@ -65,9 +63,10 @@ bool sendCAN(uint32_t id, const uint8_t *data, uint8_t len = 8) {
 
 void sendIndicators() {
   uint8_t byte1 = 0x83;
-  if (left_turn)    byte1 |= 0x04;
-  if (right_turn)   byte1 |= 0x08;
-  if (esp_active)   byte1 |= 0x20;
+  if (left_turn)  byte1 |= 0x04;
+  if (right_turn) byte1 |= 0x08;
+  if (esp_active) byte1 |= 0x20;
+
   uint8_t d[8] = {0x82, byte1, 0x00, 0x02, 0x80, 0x00, 0x00, 0x00};
   sendCAN(0x03A, d);
 }
@@ -97,8 +96,7 @@ void sendABS_ESC() {
 }
 
 void sendWakeRunning() {
-  uint8_t b1 = (head_lights ? 0x80 : 0x00) | 0x03;
-  uint8_t d[8] = {0x77, b1, 0x07, 0x3F, 0xD9, 0x06, 0x03, 0x81};
+  uint8_t d[8] = {0x77, 0x03, 0x07, 0x3F, 0xD9, 0x07, 0x03, 0x81};
   sendCAN(0x080, d);
 }
 
@@ -122,6 +120,7 @@ void sendSpeedRPM() {
 void sendOutsideTemp() {
   int t = constrain(outside_temp_c, -40, 63);
   uint16_t raw = (uint16_t)(512 + (t * 4));
+
   uint8_t d[8] = {
     0x00, 0x00, 0x00,
     (uint8_t)(raw >> 8),
@@ -140,6 +139,7 @@ void sendLights() {
   uint8_t b0 = 0x00;
   if (head_lights)    b0 = 0x80;
   else if (fog_light) b0 = 0x20;
+
   uint8_t b1 = high_beam ? 0x80 : 0x00;
   uint8_t d[8] = {b0, b1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
   sendCAN(0x1B4, d);
@@ -156,15 +156,10 @@ void sendHandbrake() {
   sendCAN(0x240, d);
 }
 
-// 0x250 — engine + oil
-// При перегреве: ОБА индикатора одновременно
-//   - масленка через byte1 0xD5 → 0x0D (как в v6.9)
-//   - check engine через byte0 0x20 → 0x40 (как в v7.4)
-// Из FocusIPCCtrl таблицы: oil+eng = {0x40, 0x0D, ...}
 void sendEngineOil() {
   bool oil_light = (coolant_temp > OIL_WARN_TEMP);
+
   if (oil_light) {
-    // масленка + check engine при перегреве
     uint8_t d[8] = {0x40, 0x0D, 0x18, 0x04, 0x1C, 0x11, 0x00, 0x00};
     sendCAN(0x250, d);
   } else {
@@ -173,8 +168,6 @@ void sendEngineOil() {
   }
 }
 
-// 0x290 — brake fluid / washer
-// ВКЛЮЧЁН обратно (он гасит ручник и низкий уровень жидкости)
 void sendBrakeFluidWasher() {
   uint8_t d[8] = {0x98, 0x00, 0x01, 0x00, 0x04, 0x03, 0x92, 0x37};
   sendCAN(0x290, d);
@@ -186,7 +179,7 @@ void sendEngineStatus() {
 }
 
 void sendAlternator() {
-  uint8_t d[8] = {0x00, 0x00, 0x00, 0x21, 0xC0, 0x00, 0x00, 0x00};
+  uint8_t d[8] = {0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00};
   sendCAN(0x300, d);
 }
 
@@ -203,32 +196,23 @@ void sendABS_213() {
   sendCAN(0x213, d);
 }
 
-// 0x320 — топливо (как в v7.0)
-// Простая отправка каждые 10мс — приборка получает 100 пакетов/сек
-// Это и обеспечивает быструю стрелку (БЕЗ умной отправки)
+// ОРИГИНАЛЬНАЯ ФОРМУЛА ИЗ can_sym.h
 void sendFuel() {
   int safe_fuel = constrain(fuel_percent, 0, 100);
 
-  uint16_t fuel_val = 7936 - (safe_fuel * 53 / 10);
-  uint8_t fuel_h = ((fuel_val >> 8) & 0xFF) | 0x10;
-  uint8_t fuel_l = fuel_val & 0xFF;
-
-  uint8_t b4 = 0x00;
-  uint8_t b5 = 0x00;
-  if (fuel_percent <= 10) {
-    b4 = 0x10;
-    b5 = 0x01;
-  } else if (fuel_percent <= 12) {
-    // зона гистерезиса
-  } else if (low_fuel_sh && fuel_percent <= 15) {
-    b4 = 0x10;
-    b5 = 0x01;
-  }
+  // can_sym.h:
+  // fuel = 0xF00 - (0x2A + fuel*235/50)
+  uint16_t fuel_val = (uint16_t)(0x0F00 - (0x002A + (safe_fuel * 235) / 50));
 
   uint8_t d[8] = {
-    0x00, 0x00,
-    fuel_h, fuel_l,
-    b4, b5, 0x00, 0x00
+    0x00,
+    0x00,
+    (uint8_t)(0x10u | ((fuel_val >> 8u) & 0x0Fu)),
+    (uint8_t)(fuel_val & 0xFFu),
+    0x00,
+    0x00,
+    0x00,
+    0x00
   };
   sendCAN(0x320, d);
 }
@@ -238,11 +222,6 @@ void sendEngineTemp() {
   uint8_t temp  = (uint8_t)(safe_temp + 60);
   uint8_t d[8]  = {0xE0, 0x00, 0x38, 0x40, 0x00, 0xE0, 0x69, temp};
   sendCAN(0x360, d);
-}
-
-void sendResetDash() {
-  uint8_t d[8] = {0x02, 0x11, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00};
-  sendCAN(0x720, d);
 }
 
 void sendWheel_4B0() {
@@ -256,6 +235,7 @@ void sendWheel_4B0() {
 
 void updateDeceleration() {
   unsigned long now = millis();
+
   if (prev_speed_time == 0) {
     prev_speed_time = now;
     prev_speed = speed_kmh;
@@ -308,10 +288,29 @@ void startupBurst() {
     sendOutsideTemp();
     sendEngineOil();
     sendWheel_4B0();
-    if ((i % 2) == 0) { sendHillStart(); sendImmobiliser(); sendLights(); }
-    if ((i % 3) == 0) { sendHandbrake(); }
-    if ((i % 6) == 0) { sendBrakeFluidWasher(); sendEngineStatus(); sendABS_213(); }
-    if ((i % 8) == 0) { sendAlternator(); sendFuel(); sendEngineTemp(); }
+
+    if ((i % 2) == 0) {
+      sendHillStart();
+      sendImmobiliser();
+      sendLights();
+    }
+
+    if ((i % 3) == 0) {
+      sendHandbrake();
+    }
+
+    if ((i % 6) == 0) {
+      sendBrakeFluidWasher();
+      sendEngineStatus();
+      sendABS_213();
+    }
+
+    if ((i % 8) == 0) {
+      sendAlternator();
+      sendFuel();
+      sendEngineTemp();
+    }
+
     delay(20);
     yield();
   }
@@ -339,26 +338,20 @@ void parseSimHub() {
     float val_f = v.toFloat();
     int   val   = (int)val_f;
 
-    if      (key == "FUEL") {
-      int new_fuel = (val_f <= 1.5f) ? constrain((int)(val_f*100+0.5f),0,100) : constrain(val,0,100);
-      if (new_fuel != fuel_percent) {
-        int diff = new_fuel - fuel_percent;
-        if (RESET_DASH_ENABLED && abs(diff) > FUEL_RESET_THRESHOLD) {
-          sendResetDash();
-          delay(30);
-          sendResetDash();
-        }
-        fuel_update_count++;
-        fuel_percent = new_fuel;
-      }
+    if (key == "FUEL") {
+      int new_fuel = (val_f <= 1.5f)
+        ? constrain((int)(val_f * 100 + 0.5f), 0, 100)
+        : constrain((int)(val_f + 0.5f), 0, 100);
+
+      fuel_percent = new_fuel;
     }
     else if (key == "SPD" || key == "SPEED")      { speed_kmh     = max(0, val); }
-    else if (key == "RPM")                        { rpm            = max(0, val); }
+    else if (key == "RPM")                        { rpm           = max(0, val); }
     else if (key == "COOLANT" || key == "WATERT" || key == "WATERTEMP") { coolant_temp = val; }
     else if (key == "OUTTEMP" || key == "AMB" || key == "AMBIENT")      { outside_temp_c = val; }
     else if (key == "L")                          { left_turn     = (val != 0); }
     else if (key == "R")                          { right_turn    = (val != 0); }
-    else if (key == "HB" || key == "HANDBRAKE")   { handbrake     = (val != 0); }
+    else if (key == "HB" || key == "HANDBRAKE")  { handbrake     = (val != 0); }
     else if (key == "ABS")                        { abs_req       = (val != 0); }
     else if (key == "BRAKE")                      { brake_pedal   = (val != 0); }
     else if (key == "ESP" || key == "TCS")        { esp_active    = (val != 0); }
@@ -374,12 +367,13 @@ void parseSimHub() {
 }
 
 void printDiag() {
-  Serial.print("[DIAG] FUEL=");        Serial.print(fuel_percent);
-  Serial.print(" CLT=");                Serial.print(coolant_temp);
-  Serial.print(" HB=");                 Serial.print(handbrake);
-  Serial.print(" oil=");                Serial.print(coolant_temp > OIL_WARN_TEMP ? 1 : 0);
-  Serial.print(" | SPD=");              Serial.print(speed_kmh);
-  Serial.print(" ABS_act=");            Serial.print(abs_active);
+  Serial.print("[DIAG] SPD=");      Serial.print(speed_kmh);
+  Serial.print(" RPM=");            Serial.print(rpm);
+  Serial.print(" FUEL=");           Serial.print(fuel_percent);
+  Serial.print(" CLT=");            Serial.print(coolant_temp);
+  Serial.print(" ABS_req=");        Serial.print(abs_req);
+  Serial.print(" ABS_act=");        Serial.print(abs_active);
+  Serial.print(" HB=");             Serial.print(handbrake);
   Serial.println();
 }
 
@@ -388,37 +382,40 @@ void setup() {
   serialBuffer.reserve(256);
   SPI.begin();
 
-  if (CAN.begin(MCP_ANY, CAN_125KBPS, MCP_8MHZ) != CAN_OK) {
+  if (CAN.begin(MCP_ANY, CAN_125KBPS, MCP_16MHZ) != CAN_OK) {
     Serial.println("CAN FAIL");
     while (1) { delay(100); yield(); }
   }
+
   CAN.setMode(MCP_NORMAL);
 
-  Serial.println("=== Focus MK3 bench v7.6 ===");
-  Serial.println("Fuel: 100 packets/sec (no smart send)");
-  Serial.println("Oil: oil + check engine on overheat");
+  Serial.println("=== Focus MK3 bench v8.1 fuel original formula ===");
   Serial.println("CAN OK");
 
   delay(300);
   startupBurst();
 
   unsigned long now = millis();
-  t10 = t50 = t100 = t120 = t300 = t1000 = tDiag = now;
+  t10 = t50 = t100 = t120 = t300 = t400 = tDiag = now;
 }
 
 void loop() {
   while (Serial.available()) {
     char c = Serial.read();
-    if (c == '\n') { parseSimHub(); serialBuffer = ""; }
-    else if (c != '\r') serialBuffer += c;
+    if (c == '\n') {
+      parseSimHub();
+      serialBuffer = "";
+    } else if (c != '\r') {
+      serialBuffer += c;
+    }
   }
 
   updateDeceleration();
   updateAbsLogic();
 
+  // Быстрая отправка топлива
   unsigned long now = millis();
 
-  // Топливо КАЖДЫЕ 10мс — постоянный поток 100/сек (как в v7.0)
   if (now - t10 >= 10) {
     t10 = now;
     sendFuel();
@@ -445,8 +442,25 @@ void loop() {
     sendABS_213();
   }
 
-  if (now - t120 >= 120) { t120 = now; sendHandbrake(); }
-  if (now - t300 >= 300) { t300 = now; sendBrakeFluidWasher(); sendEngineStatus(); sendEngineTemp(); sendAlternator(); }
-  if (now - t1000 >= 1000){ t1000= now; }
-  if (now - tDiag >= 1000){ tDiag = now; printDiag(); }
+  if (now - t120 >= 120) {
+    t120 = now;
+    sendHandbrake();
+  }
+
+  if (now - t300 >= 300) {
+    t300 = now;
+    sendBrakeFluidWasher();
+    sendEngineStatus();
+    sendEngineTemp();
+  }
+
+  if (now - t400 >= 400) {
+    t400 = now;
+    sendAlternator();
+  }
+
+  if (now - tDiag >= 1000) {
+    tDiag = now;
+    printDiag();
+  }
 }
